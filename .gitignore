@@ -1,0 +1,9 @@
+financial_backtesting-env/
+.vscode/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+env/
+venv/
+.pytest_cache/
