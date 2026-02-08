@@ -1,11 +1,139 @@
+from typing import Optional
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 import itertools
+from dataclasses import dataclass
 
-_HISTORICAL_CSV_PATH = "/Users/sztupkay/Downloads/HistoricalData_1765146671158.csv"
+_HISTORICAL_CSV_PATH = "/Users/sztupkay/Documents/scripts/financial_backtesting/monthly_qqq.csv"
+
+
+@dataclass
+class Reentry:
+    """Represents a re-entry condition for buying back into a position.
+    
+    Re-entry occurs if either:
+    - The current price drops to or below the 'price' field, OR
+    - The current date reaches or passes the 'date' field.
+    """
+    price: float
+    date: pd.Timestamp
+
+    def should_reenter(self, low_price: float, high_price: float, date: pd.Timestamp) -> Optional[float]:
+        """Check if re-entry condition is met based on price or date."""
+        if low_price <= self.price:
+            return self.price
+        elif date >= self.date:
+            return (low_price + high_price) / 2
+        return None
+
+
+class ReentryFactory:
+    """Factory for creating Reentry conditions based on strategy parameters."""
+    
+    def __init__(self, reentry_drop_ratio: float, reentry_wait_days: int):
+        self.reentry_drop_ratio = reentry_drop_ratio
+        self.reentry_wait_days = reentry_wait_days
+    
+    def create(self, sale_price: float, sale_date: pd.Timestamp) -> Reentry:
+        """Create a Reentry condition from a sale price and date."""
+        reentry_price = sale_price * (1.0 - self.reentry_drop_ratio)
+        reentry_date = sale_date + pd.to_timedelta(self.reentry_wait_days, unit='D')
+        return Reentry(price=reentry_price, date=reentry_date)    
+
+class Position:
+    """Represents a trading position holding either cash or shares."""
+    
+    def __init__(self, initial_capital: float):
+        self.shares = 0.0
+        self.cash = initial_capital
+    
+    def buy(self, price: float, date: pd.Timestamp) -> None:
+        """Buy shares with all available cash at given price."""
+        if self.shares > 0:
+            raise ValueError("Cannot buy: already holding shares")
+        amount = self.cash / price
+        self.shares = amount
+        # print(f"🟢 BOUGHT: {self.shares:.2f} shares @ {price:.2f} on {date.strftime('%Y-%m-%d')} ({self.cash:.2f}$)")
+        self.cash = 0.0
+    
+    def sell(self, price: float, date: pd.Timestamp) -> None:
+        """Sell all shares at given price for cash."""
+        if self.cash > 0:
+            raise ValueError("Cannot sell: already holding cash")
+        self.cash = self.shares * price
+        # print(f"🛑 SOLD: {self.shares:.2f} shares @ {price:.2f} on {date.strftime('%Y-%m-%d')} ({self.cash:.2f}$)")
+        self.shares = 0.0
+        
+    def get_value(self, current_price: float) -> float:
+        """Get total position value at current price."""
+        return self.shares * current_price + self.cash
+    
+    def is_in_shares(self) -> bool:
+        """Check if currently holding shares."""
+        if self.shares > 0 and self.cash > 0:
+            raise ValueError("Invalid state: position cannot hold both shares and cash")
+        return self.shares > 0
+# ----------------------------------------------------------------------
+# 1. Backtester class
+# ----------------------------------------------------------------------
+
+class Backtester:
+    """Represents a trading position (either in or out of the market)."""
+    
+    def __init__(self, initial_capital: float, historical_data: pd.DataFrame, stop_loss_ratio: float, reentry_factory: ReentryFactory):
+        self.initial_capital = initial_capital
+        self.stop_loss_ratio = stop_loss_ratio
+        self.reentry_factory = reentry_factory
+        self.reentry = None  # type: Reentry | None
+        self.position = Position(initial_capital)
+        self.position.buy((historical_data.iloc[0]['High'] + historical_data.iloc[0]['Low'])/2, historical_data.iloc[0]['Date'])
+        self.historical_data = historical_data
+        self.prev_high = historical_data.iloc[0]['High']
+        self.day_index = 0
+
+    def next_day(self):
+        self.day_index += 1
+        if self.day_index >= len(self.historical_data):
+            return False  # No more data
+        if self.position.is_in_shares():
+            self.run_in_shares_day()
+        else:
+            self.run_in_cash_day()
+        row = self.historical_data.iloc[self.day_index]
+        self.prev_high = max(self.prev_high, row['High'])
+        return True
+    
+    def run_in_shares_day(self):
+        # Logic for when the position is currently in the market
+        row = self.historical_data.iloc[self.day_index]
+        stop_loss_limit_price = self.prev_high * (1.0 - self.stop_loss_ratio)
+        if row['Low'] < stop_loss_limit_price:
+            # 🛑 STOP LOSS: Sell the position
+            # print(f"Stop loss triggered: Low {row['Low']:.2f} < prev_high {self.prev_high:.2f} with stop_loss_limit_price {stop_loss_limit_price:.2f}")
+            sale_price = min(row['High'], stop_loss_limit_price)
+            sale_date = row['Date']
+            self.position.sell(sale_price, sale_date)
+
+            self.reentry = self.reentry_factory.create(sale_price, sale_date)
+        else:
+            # 📈 HOLD: Remain in the position
+            self.in_position = True        
+
+    def run_in_cash_day(self):
+        # Logic for when the position is currently out of the market
+        row = self.historical_data.iloc[self.day_index]
+        if self.reentry is None:
+            raise ValueError("Reentry condition is not set.")
+        reentry_price = self.reentry.should_reenter(row['Low'], row['High'], row['Date'])
+        if reentry_price is not None:
+            # Re-enter the position
+            self.position.buy(reentry_price, row['Date'])
+            self.reentry = None
+            self.prev_high = row['High'] # Reset prev_high on time-based re-entry
+
 
 # ----------------------------------------------------------------------
 # 2. Strategy simulator
@@ -17,83 +145,44 @@ _HISTORICAL_CSV_PATH = "/Users/sztupkay/Downloads/HistoricalData_1765146671158.c
 # All-in, integer shares, no transaction costs.
 
 def simulate_trailing_stop_np(stop_loss_ratio: float, wait_days: int, reentry_drop_ratio: float, historical_data: pd.DataFrame) -> float:
+    """Simulates a trailing stop loss strategy with reentry on additional drops.
+    
+    Backtests a trading strategy that uses a trailing stop loss to exit positions,
+    with the ability to reenter the market when the price drops an additional amount
+    after exiting. Starts with an initial capital of $1000 and processes historical
+    price data day by day.
+    
+    Args:
+        stop_loss_ratio (float): Trailing stop loss as a decimal fraction.
+            For example, 0.13 represents a 13% trailing stop.
+        wait_days (int): Number of days to wait before allowing reentry after
+            a stop loss is triggered.
+        reentry_drop_ratio (float): Additional price drop required to trigger reentry
+            as a decimal fraction. For example, 0.14 represents a 14% additional drop.
+        historical_data (pd.DataFrame): Historical OHLC price data with at least
+            a 'Close' column. Data should be sorted chronologically.
+    
+    Returns:
+        float: Return on capital (ROC) as a percentage. For example, 5.25 represents
+            a 5.25% return on the initial $1000 capital.
+    
+    Raises:
+        Exception: May raise exceptions from Backtester or ReentryFactory if invalid
+            parameters are provided.
+    
+    Example:
+        >>> roc = simulate_trailing_stop_np(0.13, 5, 0.14, historical_data)
+        >>> print(f"Strategy returned {roc:.2f}%")
     """
-    stop_loss_ratio: trailing stop as fraction (e.g., 0.13 for 13%)
-    wait_days: wait days (integer)
-    reentry_drop_ratio: additional drop re-entry trigger as fraction (e.g., 0.14)
-    """
-    df = historical_data
+    reentry_factory = ReentryFactory(reentry_drop_ratio, wait_days)
+    backtester = Backtester(initial_capital=1000.0, historical_data=historical_data, stop_loss_ratio=stop_loss_ratio, reentry_factory=reentry_factory)
 
-    in_position = True
-    current_number_of_shares: float = 1000/((df.iloc[0]['High'] + df.iloc[0]['Low']) / 2)
-    current_cash = np.nan
-    sale_price = np.nan
-    reentry_price = np.nan
-    sale_date = pd.NaT
-    prev_high = df.iloc[0]['High']
-    # Iterate through each day
-    for index, row in df.iterrows():
-        stop_loss_limit_price = prev_high * (1.0 - stop_loss_ratio)
-        max_reentry_date = sale_date + pd.to_timedelta(wait_days, unit='D') if sale_date is not pd.NaT else pd.NaT
-
-        if in_position and (not pd.isna(sale_price) or not pd.isna(sale_date) or not pd.isna(current_cash) or pd.isna(current_number_of_shares)):
-            raise ValueError(f"Expected sale_price and sale_date to be NaN, and current_number_of_shares to be set, when in position. Got: sale_price={sale_price}, sale_date={sale_date}, current_number_of_shares={current_number_of_shares}")
-        if not in_position and (pd.isna(sale_price) or pd.isna(sale_date) or pd.isna(current_cash) or not pd.isna(current_number_of_shares)):
-            raise ValueError(
-                f"Expected sale_price, sale_date, current_cash to be set, and "
-                f"current_number_of_shares to be NaN, when not "
-                f"in position. Got: sale_price={sale_price}, "
-                f"sale_date={sale_date}, current_cash={current_cash}, "
-                f"current_number_of_shares={current_number_of_shares}"
-            )
-
-        # --- LOGIC ---
-        if in_position:
-            # Check for Stop Loss Trigger
-            if row['Low'] < stop_loss_limit_price:
-                # 🛑 STOP LOSS: Sell the position
-                in_position = False
-                sale_price = min(row['High'], stop_loss_limit_price)
-                sale_date = row['Date']
-                current_cash = current_number_of_shares * sale_price
-                # print(f"🛑 SOLD: {current_number_of_shares:.2f} shares @ {sale_price:.2f} on {row['Date'].strftime('%Y-%m-%d')}")
-                reentry_price = sale_price * (1.0 - reentry_drop_ratio)
-                current_number_of_shares = np.nan
-            else:
-                # 📈 HOLD: Remain in the position
-                in_position = True        
-        else: # Not in a position
-            # Check for Buyback/Entry Signal
-            if row['Low'] < reentry_price:
-                # 🟢 ENTRY: Buy the stock
-                in_position = True
-                sale_price = np.nan
-                sale_date = pd.NaT
-                current_number_of_shares = current_cash / reentry_price
-                # print(f"🟢 BOUGHT: {current_number_of_shares:.2f} shares @ {reentry_price:.2f} on {row['Date'].strftime('%Y-%m-%d')}")
-                current_cash = np.nan
-                reentry_price = np.nan
-            elif row['Date'] >= max_reentry_date:
-                # ⏰ TIME-BASED RE-ENTRY: Buy the stock
-                in_position = True
-                sale_price = np.nan
-                sale_date = pd.NaT
-                prev_high = row['High'] # Reset prev_high on time-based re-entry
-                current_number_of_shares = current_cash / ((row['High'] + row['Low']) / 2)
-                # print(f"🟢 BOUGHT: {current_number_of_shares:.2f} shares @ {(row['High'] + row['Low']) / 2:.2f} on {row['Date'].strftime('%Y-%m-%d')}")
-                current_cash = np.nan
-                reentry_price = np.nan
-            else:
-                # 😴 WAIT: Remain out of the position
-                in_position = False
-        prev_high = max(prev_high, row['High'])
-
-    final_value: float = current_number_of_shares * df.iloc[-1]['Close'] if in_position else current_cash
+    while backtester.next_day():
+        pass
+    final_value = backtester.position.get_value(current_price=historical_data.iloc[-1]['Close'])
     final_roc = (final_value - 1000.0) / 1000.0
-    # if in_position:
-    #     print(f"Final value (shares) with stop_loss_ratio={stop_loss_ratio:.2%}, wait_days={wait_days}, reentry_drop_ratio={reentry_drop_ratio:.2%}: {final_roc:.2%}")
-    # else:
-    #     print(f"Final value (cash) with stop_loss_ratio={stop_loss_ratio:.2%}, wait_days={wait_days}, reentry_drop_ratio={reentry_drop_ratio:.2%}: {final_roc:.2%}")
+    final_roc_pct = final_roc * 100.0
+    print(f"Final ROC with stop_loss_ratio={stop_loss_ratio:.2%}, wait_days={wait_days}, reentry_drop_ratio={reentry_drop_ratio:.2%}: {final_roc_pct:.2f}%")
     return final_roc * 100.0
 
 
@@ -209,9 +298,11 @@ def prep_historical_data(csv_path: str) -> pd.DataFrame:
     return df
 
 def get_buy_and_hold_roc(df: pd.DataFrame) -> float:
-    initial_cost = 1000 * df["Close"].iloc[0]
-    buy_and_hold_final_value: float = 1000 * df["Close"].iloc[-1]
+    initial_cost = 1000 #* df["Close"].iloc[0]
+    shares = initial_cost / ((df["High"].iloc[0] + df["Low"].iloc[0]) / 2)
+    buy_and_hold_final_value: float = shares * df["Close"].iloc[-1]
     buy_and_hold_roc: float = (buy_and_hold_final_value - initial_cost) / initial_cost * 100.0
+    print(f"Buy and Hold Final Value: {buy_and_hold_final_value:.2f}, ROC: {buy_and_hold_roc:.2f}%")
     return buy_and_hold_roc
 
 def backtesting():
